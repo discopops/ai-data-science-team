@@ -5,15 +5,14 @@
 
 
 # Libraries
-from typing import TypedDict, Annotated, Sequence, Literal
+from typing_extensions import TypedDict, Annotated, Sequence, Literal
 import operator
 
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_core.messages import BaseMessage
 
 from langgraph.types import Command
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Checkpointer
 
 import os
 import json
@@ -22,7 +21,6 @@ import pandas as pd
 from IPython.display import Markdown
 
 from ai_data_science_team.templates import (
-    node_func_execute_agent_code_on_data,
     node_func_human_review,
     node_func_fix_agent_code,
     node_func_report_agent_outputs,
@@ -38,8 +36,10 @@ from ai_data_science_team.utils.regex import (
     get_generic_summary,
 )
 from ai_data_science_team.tools.dataframe import get_dataframe_summary
-from ai_data_science_team.utils.logging import log_ai_function
+from ai_data_science_team.utils.logging import log_ai_function, log_ai_error
 from ai_data_science_team.utils.plotly import plotly_from_dict
+from ai_data_science_team.utils.sandbox import run_code_sandboxed_subprocess
+from ai_data_science_team.utils.messages import get_last_user_message_content
 
 # Setup
 AGENT_NAME = "data_visualization_agent"
@@ -232,6 +232,7 @@ class DataVisualizationAgent(BaseAgent):
         """
         response = await self._compiled_graph.ainvoke(
             {
+                "messages": [("user", user_instructions)] if user_instructions else [],
                 "user_instructions": user_instructions,
                 "data_raw": data_raw.to_dict(),
                 "max_retries": max_retries,
@@ -273,6 +274,61 @@ class DataVisualizationAgent(BaseAgent):
         """
         response = self._compiled_graph.invoke(
             {
+                "messages": [("user", user_instructions)] if user_instructions else [],
+                "user_instructions": user_instructions,
+                "data_raw": data_raw.to_dict(),
+                "max_retries": max_retries,
+                "retry_count": retry_count,
+            },
+            **kwargs,
+        )
+        self.response = response
+        return None
+
+    def invoke_messages(
+        self,
+        messages: Sequence[BaseMessage],
+        data_raw: pd.DataFrame,
+        max_retries: int = 3,
+        retry_count: int = 0,
+        **kwargs,
+    ):
+        """
+        Invokes the agent with an explicit message list (preferred for supervisors/teams).
+        """
+        user_instructions = kwargs.pop("user_instructions", None)
+        if user_instructions is None:
+            user_instructions = get_last_user_message_content(messages)
+        response = self._compiled_graph.invoke(
+            {
+                "messages": messages,
+                "user_instructions": user_instructions,
+                "data_raw": data_raw.to_dict(),
+                "max_retries": max_retries,
+                "retry_count": retry_count,
+            },
+            **kwargs,
+        )
+        self.response = response
+        return None
+
+    async def ainvoke_messages(
+        self,
+        messages: Sequence[BaseMessage],
+        data_raw: pd.DataFrame,
+        max_retries: int = 3,
+        retry_count: int = 0,
+        **kwargs,
+    ):
+        """
+        Async version of invoke_messages for supervisors/teams.
+        """
+        user_instructions = kwargs.pop("user_instructions", None)
+        if user_instructions is None:
+            user_instructions = get_last_user_message_content(messages)
+        response = await self._compiled_graph.ainvoke(
+            {
+                "messages": messages,
                 "user_instructions": user_instructions,
                 "data_raw": data_raw.to_dict(),
                 "max_retries": max_retries,
@@ -305,9 +361,9 @@ class DataVisualizationAgent(BaseAgent):
                 log_details = f"""
 ## Data Visualization Agent Log Summary:
 
-Function Path: {self.response.get('data_visualization_function_path')}
+Function Path: {self.response.get("data_visualization_function_path")}
 
-Function Name: {self.response.get('data_visualization_function_name')}
+Function Name: {self.response.get("data_visualization_function_name")}
                 """
                 if markdown:
                     return Markdown(log_details)
@@ -486,6 +542,26 @@ def make_data_visualization_agent(
 
     llm = model
 
+    MAX_SUMMARY_COLUMNS = 30
+    MAX_SUMMARY_CHARS = 5000
+
+    DEFAULT_VISUALIZATION_INSTRUCTIONS = """
+Use an appropriate chart type based on column types (categorical vs numeric). Derive columns from the provided schema; do not hardcode names. Handle missing values gracefully. Prefer plotly express for simplicity. Do not save files or print; just return a JSON-serializable Plotly figure dictionary.
+    """
+
+    def _summarize_df_for_prompt(df: pd.DataFrame) -> str:
+        df_limited = (
+            df.iloc[:, :MAX_SUMMARY_COLUMNS] if df.shape[1] > MAX_SUMMARY_COLUMNS else df
+        )
+        summary = "\n\n".join(
+            get_dataframe_summary(
+                [df_limited],
+                n_sample=min(n_samples, 5),
+                skip_stats=True,
+            )
+        )
+        return summary[:MAX_SUMMARY_CHARS]
+
     if human_in_the_loop:
         if checkpointer is None:
             print(
@@ -519,6 +595,8 @@ def make_data_visualization_agent(
         data_visualization_function_file_name: str
         data_visualization_function_name: str
         data_visualization_error: str
+        data_visualization_error_log_path: str
+        data_visualization_summary: str
         max_retries: int
         retry_count: int
 
@@ -545,8 +623,10 @@ def make_data_visualization_agent(
             
             - Formulate chart generator instructions by informing the chart generator of what type of plotly plot to use (e.g. bar, line, scatter, etc) to best represent the data. 
             - Think about how best to convey the information in the data to the user.
+            - If the user specifies a chart type (e.g., violin, box, scatter, histogram, line), you MUST use that chart type. Do NOT substitute a different chart type.
             - If the user does not specify a type of plot, select the appropriate chart type based on the data summary provided and the user's question and how best to show the results.
             - Come up with an informative title from the user's question and data provided. Also provide X and Y axis titles.
+            - If the user requests a combined \"violin+box\" plot, instruct the generator to use a violin plot with an embedded box plot (e.g., `plotly.express.violin(..., box=True)`).
             
             CHART TYPE SELECTION TIPS:
             
@@ -574,11 +654,7 @@ def make_data_visualization_agent(
         data_raw = state.get("data_raw")
         df = pd.DataFrame.from_dict(data_raw)
 
-        all_datasets_summary = get_dataframe_summary(
-            [df], n_sample=n_samples, skip_stats=False
-        )
-
-        all_datasets_summary_str = "\n\n".join(all_datasets_summary)
+        all_datasets_summary_str = _summarize_df_for_prompt(df)
 
         chart_instructor = recommend_steps_prompt | llm
 
@@ -593,7 +669,7 @@ def make_data_visualization_agent(
         return {
             "recommended_steps": format_recommended_steps(
                 recommended_steps.content.strip(),
-                heading="# Recommended Data Cleaning Steps:",
+                heading="# Recommended Data Visualization Steps:",
             ),
             "all_datasets_summary": all_datasets_summary_str,
         }
@@ -607,17 +683,17 @@ def make_data_visualization_agent(
             data_raw = state.get("data_raw")
             df = pd.DataFrame.from_dict(data_raw)
 
-            all_datasets_summary = get_dataframe_summary(
-                [df], n_sample=n_samples, skip_stats=False
+            all_datasets_summary_str = _summarize_df_for_prompt(df)
+
+            chart_generator_instructions = (
+                state.get("user_instructions") or DEFAULT_VISUALIZATION_INSTRUCTIONS
             )
-
-            all_datasets_summary_str = "\n\n".join(all_datasets_summary)
-
-            chart_generator_instructions = state.get("user_instructions")
 
         else:
             all_datasets_summary_str = state.get("all_datasets_summary")
-            chart_generator_instructions = state.get("recommended_steps")
+            chart_generator_instructions = (
+                state.get("recommended_steps") or DEFAULT_VISUALIZATION_INSTRUCTIONS
+            )
 
         prompt_template = PromptTemplate(
             template="""
@@ -705,11 +781,11 @@ def make_data_visualization_agent(
 
         def human_review(
             state: GraphState,
-        ) -> Command[Literal["chart_instructor", "explain_data_visualization_code"]]:
+        ) -> Command[Literal["chart_instructor", "report_agent_outputs"]]:
             return node_func_human_review(
                 state=state,
                 prompt_text=prompt_text_human_review,
-                yes_goto="explain_data_visualization_code",
+                yes_goto="report_agent_outputs",
                 no_goto="chart_instructor",
                 user_instructions_key="user_instructions",
                 recommended_steps_key="recommended_steps",
@@ -731,17 +807,111 @@ def make_data_visualization_agent(
             )
 
     def execute_data_visualization_code(state):
-        return node_func_execute_agent_code_on_data(
-            state=state,
-            data_key="data_raw",
-            result_key="plotly_graph",
-            error_key="data_visualization_error",
-            code_snippet_key="data_visualization_function",
-            agent_function_name=state.get("data_visualization_function_name"),
-            pre_processing=lambda data: pd.DataFrame.from_dict(data),
-            # post_processing=lambda df: df.to_dict() if isinstance(df, pd.DataFrame) else df,
-            error_message_prefix="An error occurred during data visualization: ",
+        print("    * EXECUTE DATA VISUALIZATION CODE (SANDBOXED)")
+
+        result, error = run_code_sandboxed_subprocess(
+            code_snippet=state.get("data_visualization_function"),
+            function_name=state.get("data_visualization_function_name"),
+            data=state.get("data_raw"),
+            timeout=15,
+            memory_limit_mb=512,
+            data_format="dataframe",
         )
+
+        validation_error = error
+        viz_summary = None
+
+        if error is None:
+            try:
+                fig = plotly_from_dict(result)
+                if fig is None:
+                    validation_error = "Plotly figure could not be reconstructed."
+                else:
+                    traces = len(fig.data) if hasattr(fig, "data") else 0
+                    viz_summary = f"Plotly figure with {traces} trace(s) generated."
+                    # Validate chart type against explicit user request when possible.
+                    req = (state.get("user_instructions") or "").lower()
+                    if req:
+                        expected = set()
+                        if "violin" in req:
+                            expected.add("violin")
+                        if "box" in req:
+                            expected.add("box")
+                        if "hist" in req:
+                            expected.add("histogram")
+                        if "scatter" in req:
+                            expected.add("scatter")
+                        if "heatmap" in req:
+                            expected.add("heatmap")
+                        if "bar" in req:
+                            expected.add("bar")
+                        if "line" in req:
+                            expected.add("line")
+
+                        actual_types = {
+                            getattr(t, "type", None)
+                            for t in getattr(fig, "data", []) or []
+                            if getattr(t, "type", None)
+                        }
+
+                        def has_line() -> bool:
+                            for t in getattr(fig, "data", []) or []:
+                                if getattr(t, "type", None) == "scatter":
+                                    mode = (getattr(t, "mode", "") or "").lower()
+                                    if "lines" in mode:
+                                        return True
+                            return False
+
+                        mismatch = None
+                        if "violin" in expected and "violin" not in actual_types:
+                            mismatch = "violin"
+                        elif "box" in expected and "violin" not in expected and "box" not in actual_types:
+                            mismatch = "box"
+                        elif "histogram" in expected and "histogram" not in actual_types:
+                            mismatch = "histogram"
+                        elif "bar" in expected and "bar" not in actual_types:
+                            mismatch = "bar"
+                        elif "heatmap" in expected and "heatmap" not in actual_types:
+                            mismatch = "heatmap"
+                        elif "scatter" in expected and "scatter" not in actual_types:
+                            mismatch = "scatter"
+                        elif "line" in expected and not has_line():
+                            mismatch = "line"
+
+                        if mismatch:
+                            got = ", ".join(sorted(actual_types)) if actual_types else "unknown"
+                            validation_error = (
+                                "Chart type mismatch. "
+                                f"User requested '{mismatch}' style, but got '{got}'. "
+                                f"User instructions: {state.get('user_instructions')!r}"
+                            )
+            except Exception as exc:
+                validation_error = f"Plotly reconstruction failed: {exc}"
+
+        error_prefixed = (
+            f"An error occurred during data visualization: {validation_error}"
+            if validation_error
+            else None
+        )
+
+        error_log_path = None
+        if error_prefixed and log:
+            error_log_path = log_ai_error(
+                error_message=error_prefixed,
+                file_name=f"{file_name}_errors.log",
+                log=log,
+                log_path=log_path if log_path is not None else LOG_PATH,
+                overwrite=False,
+            )
+            if error_log_path:
+                print(f"      Error logged to: {error_log_path}")
+
+        return {
+            "plotly_graph": result if error_prefixed is None else None,
+            "data_visualization_error": error_prefixed,
+            "data_visualization_error_log_path": error_log_path,
+            "data_visualization_summary": viz_summary,
+        }
 
     def fix_data_visualization_code(state: GraphState):
         prompt = """
@@ -753,6 +923,12 @@ def make_data_visualization_agent(
         
         This is the broken code (please fix): 
         {code_snippet}
+
+        User instructions:
+        {user_instructions}
+
+        Recommended steps (if any):
+        {recommended_steps}
 
         Last Known Error:
         {error}
@@ -780,6 +956,8 @@ def make_data_visualization_agent(
                 "data_visualization_function_path",
                 "data_visualization_function_name",
                 "data_visualization_error",
+                "data_visualization_error_log_path",
+                "data_visualization_summary",
             ],
             result_key="messages",
             role=AGENT_NAME,

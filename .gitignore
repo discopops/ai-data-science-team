@@ -170,6 +170,9 @@ cython_debug/
 h2o_models/
 mlruns/
 reports/
+mlflow.db
+mlflow.db-*
+mlflow_artifacts/
 
 # Draw.io
 *.drawio

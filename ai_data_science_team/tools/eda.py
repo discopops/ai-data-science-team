@@ -1,7 +1,8 @@
-from typing import Annotated, Dict, Tuple, Union
+from typing_extensions import Annotated, Dict, Tuple, Union
 
 import os
 import tempfile
+import warnings
 
 from langchain.tools import tool
 
@@ -77,7 +78,9 @@ def describe_dataset(
     df = pd.DataFrame(data_raw)
     description_df = df.describe(include="all")
     content = "Summary statistics computed using pandas describe()."
-    artifact = {"describe_df": description_df.to_dict()}
+    # Flatten: orient="index" gives rows=stat, columns=columns
+    flattened = description_df.reset_index().rename(columns={"index": "stat"})
+    artifact = {"describe_df": flattened.to_dict(orient="list")}
     return content, artifact
 
 
@@ -284,6 +287,7 @@ def generate_sweetviz_report(
     report_name: str = "sweetviz_report.html",
     report_directory: str = None,  # <-- Default to None
     open_browser: bool = False,
+    include_html: bool = False,
 ) -> Tuple[str, Dict]:
     """
     Tool: generate_sweetviz_report
@@ -303,6 +307,8 @@ def generate_sweetviz_report(
         If None, a temporary directory is created and used.
     open_browser : bool, optional
         Whether to open the report in a web browser. Default is False.
+    include_html : bool, optional
+        If True, includes the full HTML content in the returned artifact. Default is False.
 
     Returns:
     --------
@@ -335,7 +341,18 @@ def generate_sweetviz_report(
             os.makedirs(report_directory)
 
     # Create the Sweetviz report.
-    report = sv.analyze(df, target_feat=target)
+    # Sweetviz internally calls warnings.filterwarnings on np.VisibleDeprecationWarning; this is removed in numpy>=2.
+    import numpy as np
+
+    # NumPy >= 2 removed VisibleDeprecationWarning; Sweetviz still references it directly.
+    if not hasattr(np, "VisibleDeprecationWarning"):
+        # Provide a compatible placeholder to avoid AttributeError inside Sweetviz.
+        np.VisibleDeprecationWarning = DeprecationWarning
+
+    visible_dep = getattr(np, "VisibleDeprecationWarning", DeprecationWarning)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=visible_dep)
+        report = sv.analyze(df, target_feat=target)
 
     # Determine the full path for the report.
     full_report_path = os.path.join(report_directory, report_name)
@@ -346,12 +363,13 @@ def generate_sweetviz_report(
         open_browser=open_browser,
     )
 
-    # Optionally, read the HTML content (if desired to pass along in the artifact).
-    try:
-        with open(full_report_path, "r", encoding="utf-8") as f:
-            html_content = f.read()
-    except Exception:
-        html_content = None
+    html_content = None
+    if include_html:
+        try:
+            with open(full_report_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+        except Exception:
+            html_content = None
 
     content = (
         f"Sweetviz EDA report generated and saved as '{os.path.abspath(full_report_path)}'. "

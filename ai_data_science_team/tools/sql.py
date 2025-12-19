@@ -1,4 +1,3 @@
-
 import pandas as pd
 import sqlalchemy as sql
 from sqlalchemy import inspect
@@ -8,7 +7,7 @@ def get_database_metadata(connection, n_samples=10) -> dict:
     """
     Collects metadata and sample data from a database, with safe identifier quoting and
     basic dialect-aware row limiting. Prevents issues with spaces/reserved words in identifiers.
-    
+
     Parameters
     ----------
     connection : Union[sql.engine.base.Connection, sql.engine.base.Engine]
@@ -37,17 +36,19 @@ def get_database_metadata(connection, n_samples=10) -> dict:
 
         metadata["dialect"] = sql_engine.dialect.name
         metadata["driver"] = sql_engine.driver
-        metadata["connection_url"] = str(sql_engine.url)
+        try:
+            metadata["connection_url"] = sql_engine.url.render_as_string(
+                hide_password=True
+            )
+        except Exception:
+            metadata["connection_url"] = str(sql_engine.url)
 
         inspector = inspect(sql_engine)
         preparer = inspector.bind.dialect.identifier_preparer
 
         # For each schema
         for schema_name in inspector.get_schema_names():
-            schema_obj = {
-                "schema_name": schema_name,
-                "tables": []
-            }
+            schema_obj = {"schema_name": schema_name, "tables": []}
 
             tables = inspector.get_table_names(schema=schema_name)
             for table_name in tables:
@@ -56,7 +57,7 @@ def get_database_metadata(connection, n_samples=10) -> dict:
                     "columns": [],
                     "primary_key": [],
                     "foreign_keys": [],
-                    "indexes": []
+                    "indexes": [],
                 }
                 # Get columns
                 columns = inspector.get_columns(table_name, schema=schema_name)
@@ -67,7 +68,9 @@ def get_database_metadata(connection, n_samples=10) -> dict:
                     col_name_quoted = preparer.quote_identifier(col_name)
 
                     # Build query for sample data
-                    query = build_query(col_name_quoted, table_name_quoted, n_samples, dialect_name)
+                    query = build_query(
+                        col_name_quoted, table_name_quoted, n_samples, dialect_name
+                    )
 
                     # Retrieve sample data
                     try:
@@ -76,14 +79,14 @@ def get_database_metadata(connection, n_samples=10) -> dict:
                     except Exception as e:
                         samples = [f"Error retrieving data: {str(e)}"]
 
-                    table_info["columns"].append({
-                        "name": col_name,
-                        "type": col_type,
-                        "sample_values": samples
-                    })
+                    table_info["columns"].append(
+                        {"name": col_name, "type": col_type, "sample_values": samples}
+                    )
 
                 # Primary keys
-                pk_constraint = inspector.get_pk_constraint(table_name, schema=schema_name)
+                pk_constraint = inspector.get_pk_constraint(
+                    table_name, schema=schema_name
+                )
                 table_info["primary_key"] = pk_constraint.get("constrained_columns", [])
 
                 # Foreign keys
@@ -92,7 +95,7 @@ def get_database_metadata(connection, n_samples=10) -> dict:
                     {
                         "local_cols": fk["constrained_columns"],
                         "referred_table": fk["referred_table"],
-                        "referred_cols": fk["referred_columns"]
+                        "referred_cols": fk["referred_columns"],
                     }
                     for fk in fks
                 ]
@@ -102,16 +105,19 @@ def get_database_metadata(connection, n_samples=10) -> dict:
                 table_info["indexes"] = idxs
 
                 schema_obj["tables"].append(table_info)
-            
+
             metadata["schemas"].append(schema_obj)
-    
+
     finally:
         if is_engine:
             conn.close()
 
     return metadata
 
-def build_query(col_name_quoted: str, table_name_quoted: str, n: int, dialect_name: str) -> str:
+
+def build_query(
+    col_name_quoted: str, table_name_quoted: str, n: int, dialect_name: str
+) -> str:
     # Example: expand your build_query to handle random sampling if possible
     if "postgres" in dialect_name:
         return f"SELECT {col_name_quoted} FROM {table_name_quoted} ORDER BY RANDOM() LIMIT {n}"
@@ -123,4 +129,3 @@ def build_query(col_name_quoted: str, table_name_quoted: str, n: int, dialect_na
         return f"SELECT TOP {n} {col_name_quoted} FROM {table_name_quoted} ORDER BY NEWID()"
     # Oracle or fallback
     return f"SELECT {col_name_quoted} FROM {table_name_quoted} WHERE ROWNUM <= {n}"
-
